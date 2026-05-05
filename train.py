@@ -1,176 +1,183 @@
+"""
+训练脚本 - 优化版
+支持：模块化结构、验证集、学习率调度、梯度裁剪、迭代可视化
+"""
 import os
 import torch
 import torch.nn as nn
-import pandas as pd
-import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-from torch.utils.data import Dataset, DataLoader
+from config import *
+from models import TransformerModel
+from data_utils import load_data, preprocess_data, create_sequences, create_data_loaders
+from visualization import Visualizer
 
-# =========================
-# 参数
-# =========================
-SEQ_LEN = 24
-BATCH_SIZE = 32
-EPOCHS = 50
-LR = 0.001
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_PATH = "model/transformer_model.pth"
 
-# =========================
-# 创建目录
-# =========================
-os.makedirs("model", exist_ok=True)
+def train_model():
+    """训练模型"""
+    # 创建目录
+    os.makedirs("model", exist_ok=True)
+    os.makedirs(VISUALIZATION_DIR, exist_ok=True)
 
-# =========================
-# 数据读取
-# =========================
-df = pd.read_csv("data/load_data.csv")
+    # 初始化可视化器
+    visualizer = Visualizer(save_dir=VISUALIZATION_DIR, show=SHOW_VISUALIZATION)
 
-values = df['load'].values.reshape(-1,1)
+    # 加载数据
+    print("=" * 50)
+    print("📥 加载数据...")
+    print("=" * 50)
+    values = load_data(DATA_PATH)
+    scaled, scaler = preprocess_data(values)
 
-scaler = MinMaxScaler()
-scaled = scaler.fit_transform(values)
+    # 绘制数据分布
+    visualizer.plot_data_distribution(values, "原始负荷数据")
+    print(f"数据总量: {len(values)} 条")
+    print(f"数据范围: [{values.min():.2f}, {values.max():.2f}]")
 
-# =========================
-# 构造时间序列
-# =========================
-def create_sequences(data, seq_len):
-    X = []
-    y = []
+    # 创建序列
+    print("\n📊 创建时间序列...")
+    X, y = create_sequences(scaled, SEQ_LEN)
+    print(f"序列数量: {len(X)} 条 (序列长度: {SEQ_LEN})")
 
-    for i in range(len(data)-seq_len):
-        X.append(data[i:i+seq_len])
-        y.append(data[i+seq_len])
+    # 创建数据加载器（含验证集）
+    train_loader, val_loader = create_data_loaders(X, y, BATCH_SIZE)
+    print(f"训练集: {len(train_loader.dataset)} 条")
+    print(f"验证集: {len(val_loader.dataset)} 条")
 
-    return np.array(X), np.array(y)
+    # 初始化模型
+    print("\n🏗️ 初始化模型...")
+    model = TransformerModel(
+        d_model=D_MODEL,
+        nhead=N_HEAD,
+        dim_feedforward=DIM_FEEDFORWARD,
+        dropout=DROPOUT,
+        num_layers=NUM_LAYERS
+    ).to(DEVICE)
 
-X, y = create_sequences(scaled, SEQ_LEN)
+    # 打印模型参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"总参数量: {total_params:,}")
+    print(f"可训练参数: {trainable_params:,}")
 
-split = int(len(X)*0.8)
+    # 绘制模型架构
+    visualizer.plot_model_architecture(model, (SEQ_LEN, 1))
 
-X_train = X[:split]
-y_train = y[:split]
+    # 定义损失函数和优化器
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
 
-class LoadDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.FloatTensor(X)
-        self.y = torch.FloatTensor(y)
+    # 训练循环
+    print("\n🚀 开始训练...")
+    print("=" * 50)
+    best_val_loss = float('inf')
 
-    def __len__(self):
-        return len(self.X)
+    for epoch in range(1, EPOCHS + 1):
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
 
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        for X_batch, y_batch in train_loader:
+            X_batch = X_batch.to(DEVICE)
+            y_batch = y_batch.to(DEVICE)
 
-train_loader = DataLoader(
-    LoadDataset(X_train, y_train),
-    batch_size=BATCH_SIZE,
-    shuffle=True
-)
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            loss.backward()
 
-# =========================
-# Positional Encoding
-# =========================
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super().__init__()
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1)
+            optimizer.step()
+            train_loss += loss.item()
 
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) *
-            (-np.log(10000.0) / d_model)
-        )
+        avg_train_loss = train_loss / len(train_loader)
 
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        # 验证阶段
+        avg_val_loss = None
+        if val_loader:
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for X_val, y_val in val_loader:
+                    X_val = X_val.to(DEVICE)
+                    y_val = y_val.to(DEVICE)
+                    outputs = model(X_val)
+                    loss = criterion(outputs, y_val)
+                    val_loss += loss.item()
 
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+            avg_val_loss = val_loss / len(val_loader)
 
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
+            # 学习率调度
+            scheduler.step(avg_val_loss)
 
-# =========================
-# Transformer
-# =========================
-class TransformerModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.embedding = nn.Linear(1, 64)
+            # 保存最佳模型
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                torch.save(model.state_dict(), MODEL_PATH)
 
-        self.pos_encoder = PositionalEncoding(64)
+        # 更新可视化历史
+        visualizer.update_training_history(epoch, avg_train_loss, avg_val_loss)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=64,
-            nhead=8,
-            dim_feedforward=256,
-            dropout=0.1,
-            batch_first=True
-        )
+        # 定期生成可视化
+        if epoch % 5 == 0 or epoch == EPOCHS:
+            # 绘制训练损失曲线
+            visualizer.plot_training_loss(epoch)
 
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=3
-        )
+            # 创建训练摘要图
+            current_lr = optimizer.param_groups[0]['lr']
+            visualizer.create_training_summary(
+                epoch, avg_train_loss, avg_val_loss,
+                learning_rate=current_lr
+            )
 
-        self.fc = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
+            # 验证集预测对比
+            if val_loader:
+                model.eval()
+                with torch.no_grad():
+                    sample_X, sample_y = next(iter(val_loader))
+                    sample_X = sample_X.to(DEVICE)
+                    predictions = model(sample_X).cpu().numpy()
+                    true_values = sample_y.numpy()
 
-    def forward(self, x):
+                visualizer.plot_prediction_comparison(
+                    true_values, predictions, epoch,
+                    title="验证集预测对比"
+                )
 
-        x = self.embedding(x)
+        # 打印训练信息
+        if avg_val_loss is not None:
+            status = "⭐ 最佳" if avg_val_loss <= best_val_loss else ""
+            print(f"Epoch {epoch:3d}/{EPOCHS} | "
+                  f"训练损失: {avg_train_loss:.6f} | "
+                  f"验证损失: {avg_val_loss:.6f} | "
+                  f"LR: {optimizer.param_groups[0]['lr']:.6f} {status}")
+        else:
+            print(f"Epoch {epoch:3d}/{EPOCHS} | "
+                  f"训练损失: {avg_train_loss:.6f}")
 
-        x = self.pos_encoder(x)
+    # 保存最终模型
+    if not val_loader:
+        torch.save(model.state_dict(), MODEL_PATH)
 
-        x = self.transformer(x)
+    # 生成最终可视化报告
+    print("\n" + "=" * 50)
+    print("📈 生成最终可视化报告...")
+    visualizer.create_training_summary(
+        EPOCHS, avg_train_loss,
+        avg_val_loss if val_loader else None,
+        additional_info=f"最佳验证损失: {best_val_loss:.6f}"
+    )
 
-        x = x[:, -1, :]
+    print("\n✅ 训练完成！")
+    print(f"📊 最佳验证损失: {best_val_loss:.6f}")
+    print(f"💾 模型保存至: {MODEL_PATH}")
+    print(f"🖼️ 可视化保存至: {VISUALIZATION_DIR}/")
 
-        return self.fc(x)
+    return model, scaler
 
-# =========================
-# 初始化
-# =========================
-model = TransformerModel().to(DEVICE)
-criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-# =========================
-# 训练
-# =========================
-for epoch in range(EPOCHS):
-
-    model.train()
-    total_loss = 0
-
-    for X_batch, y_batch in train_loader:
-
-        X_batch = X_batch.to(DEVICE)
-        y_batch = y_batch.to(DEVICE)
-
-        optimizer.zero_grad()
-
-        outputs = model(X_batch)
-
-        loss = criterion(outputs, y_batch)
-
-        loss.backward()
-
-        optimizer.step()
-
-        total_loss += loss.item()
-
-    print(f"Epoch {epoch+1}/{EPOCHS} Loss: {total_loss/len(train_loader):.6f}")
-
-# =========================
-# 保存模型
-# =========================
-torch.save(model.state_dict(), MODEL_PATH)
-
-print("模型训练完成")
-print(f"模型保存至: {MODEL_PATH}")
+if __name__ == "__main__":
+    train_model()

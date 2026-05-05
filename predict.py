@@ -1,3 +1,8 @@
+"""
+预测脚本 - 优化版
+支持：模块化结构、多步预测、可视化输出
+"""
+import os
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -5,119 +10,173 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
 
-SEQ_LEN = 24
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+from config import *
+from models import TransformerModel
+from data_utils import load_data, preprocess_data
+from visualization import Visualizer
 
-# =========================
-# 读取数据
-# =========================
-df = pd.read_csv("data/load_data.csv")
 
-values = df['load'].values.reshape(-1,1)
+def load_model(model_path):
+    """加载模型"""
+    model = TransformerModel(
+        d_model=D_MODEL,
+        nhead=N_HEAD,
+        dim_feedforward=DIM_FEEDFORWARD,
+        dropout=DROPOUT,
+        num_layers=NUM_LAYERS
+    ).to(DEVICE)
 
-scaler = MinMaxScaler()
-scaled = scaler.fit_transform(values)
+    model.load_state_dict(
+        torch.load(model_path, weights_only=False, map_location=DEVICE)
+    )
+    model.eval()
+    return model
 
-# =========================
-# PositionalEncoding
-# =========================
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super().__init__()
 
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1)
+def predict_next_hour(model, scaler, values, seq_len=SEQ_LEN):
+    """预测下一小时负荷"""
+    # 取最近 seq_len 小时的数据
+    latest_seq = values[-seq_len:]
+    scaled_seq = scaler.transform(latest_seq.reshape(-1, 1))
 
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) *
-            (-np.log(10000.0) / d_model)
-        )
+    input_data = torch.FloatTensor(scaled_seq).unsqueeze(0).to(DEVICE)
 
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+    with torch.no_grad():
+        pred = model(input_data)
 
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+    pred_value = scaler.inverse_transform(pred.cpu().numpy())
+    return pred_value[0][0]
 
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
 
-# =========================
-# 模型
-# =========================
-class TransformerModel(nn.Module):
-    def __init__(self):
-        super().__init__()
+def predict_multi_step(model, scaler, values, steps=24, seq_len=SEQ_LEN):
+    """多步预测"""
+    predictions = []
+    current_seq = values[-seq_len:].copy()
 
-        self.embedding = nn.Linear(1, 64)
+    for _ in range(steps):
+        scaled_seq = scaler.transform(current_seq.reshape(-1, 1))
+        input_data = torch.FloatTensor(scaled_seq).unsqueeze(0).to(DEVICE)
 
-        self.pos_encoder = PositionalEncoding(64)
+        with torch.no_grad():
+            pred = model(input_data)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=64,
-            nhead=8,
-            dim_feedforward=256,
-            dropout=0.1,
-            batch_first=True
-        )
+        pred_value = scaler.inverse_transform(pred.cpu().numpy())[0][0]
+        predictions.append(pred_value)
 
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=3
-        )
+        # 滑动窗口更新
+        current_seq = np.append(current_seq[1:], pred_value)
 
-        self.fc = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
+    return np.array(predictions)
 
-    def forward(self, x):
 
-        x = self.embedding(x)
+def main():
+    """主函数"""
+    os.makedirs(VISUALIZATION_DIR, exist_ok=True)
 
-        x = self.pos_encoder(x)
+    # 初始化可视化器
+    visualizer = Visualizer(save_dir=VISUALIZATION_DIR, show=SHOW_VISUALIZATION)
 
-        x = self.transformer(x)
+    # 加载数据
+    print("=" * 50)
+    print("📥 加载数据...")
+    values = load_data(DATA_PATH)
+    scaled, scaler = preprocess_data(values)
+    print(f"数据总量: {len(values)} 条")
 
-        x = x[:, -1, :]
+    # 加载模型
+    print("\n🔧 加载模型...")
+    model = load_model(MODEL_PATH)
+    print(f"模型加载完成: {MODEL_PATH}")
 
-        return self.fc(x)
+    # 单步预测：下一小时
+    print("\n" + "=" * 50)
+    print("🔮 预测下一小时负荷...")
+    next_hour_pred = predict_next_hour(model, scaler, values)
+    print(f"下一小时预测负荷: {next_hour_pred:.2f}")
+    print(f"最近一小时实际负荷: {values[-1][0]:.2f}")
 
-# =========================
-# 加载模型
-# =========================
-model = TransformerModel().to(DEVICE)
+    # 多步预测：未来24小时
+    print("\n" + "=" * 50)
+    print("🔮 预测未来24小时负荷...")
+    multi_step_preds = predict_multi_step(model, scaler, values, steps=24)
+    for i, pred in enumerate(multi_step_preds, 1):
+        print(f"  +{i:2d}小时: {pred:.2f}")
 
-model.load_state_dict(
-    torch.load("model/transformer_model.pth", weights_only=False)
-)
+    # =========================
+    # 可视化
+    # =========================
+    print("\n" + "=" * 50)
+    print("🖼️ 生成可视化...")
 
-model.eval()
+    # 图1: 历史数据 + 单步预测
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
-# =========================
-# 最近24小时预测下一小时
-# =========================
-latest_seq = scaled[-SEQ_LEN:]
+    # 子图1: 最近100小时历史 + 下一小时预测
+    ax1 = axes[0, 0]
+    recent = values[-100:]
+    ax1.plot(range(len(recent)), recent, 'b-', label="历史负荷", linewidth=1.5)
+    ax1.scatter(len(recent), next_hour_pred, s=150, c='red', zorder=5,
+               label=f"预测值: {next_hour_pred:.2f}", edgecolors='black')
+    ax1.set_xlabel("时间步 (小时)")
+    ax1.set_ylabel("负荷")
+    ax1.set_title("下一小时负荷预测")
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
 
-input_data = torch.FloatTensor(latest_seq).unsqueeze(0).to(DEVICE)
+    # 子图2: 未来24小时预测
+    ax2 = axes[0, 1]
+    hours = np.arange(1, 25)
+    ax2.plot(hours, multi_step_preds, 'r-o', linewidth=2, markersize=5,
+            label="预测负荷")
+    ax2.fill_between(hours,
+                     multi_step_preds * 0.95,
+                     multi_step_preds * 1.05,
+                     alpha=0.2, color='red', label="±5% 置信区间")
+    ax2.set_xlabel("未来时间 (小时)")
+    ax2.set_ylabel("负荷")
+    ax2.set_title("未来24小时负荷预测")
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3)
 
-with torch.no_grad():
-    pred = model(input_data)
+    # 子图3: 最近200小时趋势 + 24小时预测衔接
+    ax3 = axes[1, 0]
+    historical = values[-200:]
+    all_values = np.concatenate([historical.flatten(), multi_step_preds])
+    ax3.plot(range(len(historical)), historical, 'b-', label="历史负荷", linewidth=1.5)
+    ax3.plot(range(len(historical) - 1, len(historical) + 24),
+             np.concatenate([[historical[-1][0]], multi_step_preds]),
+             'r--o', linewidth=2, markersize=4, label="预测负荷")
+    ax3.axvline(x=len(historical) - 1, color='gray', linestyle=':', alpha=0.7)
+    ax3.set_xlabel("时间步 (小时)")
+    ax3.set_ylabel("负荷")
+    ax3.set_title("历史负荷与预测衔接")
+    ax3.legend(fontsize=10)
+    ax3.grid(True, alpha=0.3)
 
-pred_value = scaler.inverse_transform(pred.cpu().numpy())
+    # 子图4: 预测值分布
+    ax4 = axes[1, 1]
+    ax4.hist(multi_step_preds, bins=12, color='coral', edgecolor='black', alpha=0.7)
+    ax4.axvline(x=next_hour_pred, color='red', linestyle='--', linewidth=2,
+               label=f"下一小时: {next_hour_pred:.2f}")
+    ax4.set_xlabel("负荷值")
+    ax4.set_ylabel("频数")
+    ax4.set_title("未来24小时预测分布")
+    ax4.legend(fontsize=10)
+    ax4.grid(True, alpha=0.3)
 
-print("下一小时预测负荷:")
-print(pred_value[0][0])
+    plt.tight_layout()
 
-# =========================
-# 可视化
-# =========================
-plt.figure(figsize=(10,5))
+    # 保存图片
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_path = os.path.join(VISUALIZATION_DIR, f"prediction_{timestamp}.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"✅ 预测可视化已保存: {save_path}")
 
-plt.plot(values[-100:], label="Historical Load")
-plt.scatter(len(values), pred_value[0][0], s=100, label="Forecast")
+    plt.show()
 
-plt.legend()
-plt.title("Transformer Load Forecast")
-plt.show()
+    print("\n✅ 预测完成！")
+
+
+if __name__ == "__main__":
+    main()
